@@ -7,7 +7,137 @@
 
 # Abstract
 
-This document summarizes ongoing research on local lifetimes, a feature that enables programmers to safely take advantage of objects and operations that are only safe to use for a limited time.
+Currently all parameters to non-inline functions in Kotlin are treated as escaping by default.
+This means they can be accessed after the function call finishes. In real code, many parameters are executed only during the function call.
+This behaviour is described in Kotlin with the `callsInPlace` contract (with `InvocationKind.UNKNOWN`), though only for functional parameters, and functional parameters to `inline` functions already have this behavior by default.
+
+```kotlin
+fun example(escapingLambda : () -> Unit, callsInPlaceLambda : () -> Unit) {
+    contract {
+        callsInPlace(callsInPlaceLambda, InvocationKind.UNKNOWN)
+    }
+    globalStorage = escapingLambda // escapes
+    callsInPlaceLambda()  // executed in place
+}
+```
+
+The development of the new checker has demonstrated that `callsInPlace` is becoming more than just a contract for library authors.
+It is already the most popular contract:
+
+Total contract hits on GitHub: [18.3k](https://github.com/search?q=%2Fcontract%5Cs*%5C%7B%28%3Fs%29.*%3F%28callsInPlace%7Cimplies%7CholdsIn%29.*%3F%5C%7D%2F+language%3AKotlin&type=code)
+
+`callsInplace` contract hits on GitHub: [11.8k](https://github.com/search?q=%2Fcontract%5Cs*%5C%7B%28%3Fs%29.*callsInPlace%5Cs*%5C%28%5B%5E%29%5D*%28EXACTLY_ONCE%7CAT_MOST_ONCE%7CAT_LEAST_ONCE%7CUNKNOWN%29%5B%5E%29%5D*%5C%29.*%3F%5C%7D%2F+language%3AKotlin&type=code)
+
+This popularity is expected: `callsInPlace` gives the compiler information about lambda execution order, which enables additional smart casts and definite-assignment analysis.
+These capabilities, along with new capabilities intended by this proposal, are described in more detail in [Current State and New Capabilities](#current-state-and-new-capabilities).
+
+However, the current contract syntax is still experimental and has several design limits: it is verbose, cannot be used in functions without bodies, and not fully verified.
+
+Because of that, stabilizing the current form may not be enough.
+[KEEP 464](https://github.com/Kotlin/KEEP/blob/main/proposals/KEEP-0464-local-lambda-parameters.md) proposes to introduce new `local` syntax in order to streamline the useful behavior of `callsInPlace`, make it stable, and remove the main drawbacks of the current contract-based design.
+But KEEP 464 still restricts itself to functional arguments and CFG analyses, which limits the benefits that locality can provide.
+This document extends that work further to arbitrary objects by incorporating local *lifetimes* directly into the type system.
+
+Incorporating local lifetimes directly into the type system makes the language more robust.
+For example, the following program is accepted using local lifetimes but rejected using KEEP 464's CFG analyses:
+```
+fun <T> Sequence<T>.sum(local convert: (T) -> Int): Int
+    = map(convert).sum()
+```
+One issue is that CFG analyses are intraprocedural (except for `inline` functions), and so have to treat `map` as a black box that could potentially leak `convert`.
+Another issue is that—even if we were to inline `map`—`map` returns a sequence that *lazily* generates its values, and that *object* repeatedly calls `convert`, which looks to the CFG analysis like the function is being leaked onto the heap.
+By integrating locality into the type system, we can restrict the lifetime of that object, and then later confirm that it is only used within its restricted lifetime.
+As an experiment, we updated much of the standard library to use local lifetimes, and we found that the design was able to verify all cases where parameters were known to be used only during the lifetime of the call (even eliminating the need for some `crossinline` annotations currently in the standard library).
+
+## Current State and New Capabilities
+
+In addition to improving the power of the analysis, this design provides functionality enabled by the better lifetime guarantees, only some of which is already supported by `callsInPlace`.
+
+### Smart Casts
+
+Because a `callsInPlace`/`local` lambda is executed in place, the compiler knows enough of the execution order to allow some more smart casts.
+In this example, the lambda passed to `someFunction` is executed before `x = null`, so `x` can be smart-cast to `String` inside the lambda.
+
+```kotlin
+fun useCaseCallsInPlace() {
+    var x: String? = "hello"
+    if (x != null) {
+        someFunction(true) {
+            // After adding local or a contract with callsInPlace
+            // x is smartcast to String
+            println(x.length)
+        }
+    }
+    x = null // Variable may change before the lambda executes.
+}
+```
+
+### Preventing Escapes and Temporary Objects
+
+`callsInPlace` can only be applied to functional parameters, whereas `local` can be applied to arbitrary parameters.
+This can be used to help prevent resources from escaping and being used after they are released.
+For example, if one were to provide the following utility function
+```
+fun <R> File.readBuffered(local once block: (local BufferedReader) -> R): R {
+    FileReader(this).use {
+        return block(BufferedReader(it))
+    }
+}
+```
+then the following buggy program would fail to type-check:
+```
+fun buggy(file: File) {
+    val reader
+    file.readBuffered {
+        reader = it
+    }
+    reader.readLine()
+}
+```
+Because the parameter to `block` is marked as `local`, the new type system ensures that it is used only locally within `block`.
+But here we see that it is leaked to the outer scope of the calling function via the assignment `reader = it`, so the new type system flags this as an error.
+
+This pattern of temporary objects occurs often, and not just with resources.
+For example, builders often given a building function a mutable version of the data structure from which an immutable version is constructed.
+The expectation is that the mutable version is no longer accessed after the building function has completed, and now we can enforce that by making the mutable version be a `local` parameter to the building function.
+
+### Non-Local `return`
+
+Currently, non-local returns are only allowed for `inline` functions.
+However, since `local` guarantees that a lambda executes within the caller, we can allow non-local returns.
+This is useful for large functions where inlining would cause code bloat.
+
+As an example, suppose we want to compute the mean of a sequence of strings representing numbers, returning `null` if any string in the sequence fails to represent a number.
+The standard library already provides an `average` extension method on sequences of the various numeric primitive types, and it already deals with corner cases like overflowing the counter for large sequences, so we would like to reuse it.
+The problem is that `average` does not handle nullable numbers, so we cannot simply use `sequence.map(String::toDoubleOrNull)`.
+We could use `sequence.map(String::toDouble)` and catch `NumberFormatException`, but exceptions are generally discouraged in Kotlin.
+
+With local lifetimes, we can support this easily using a non-local return:
+```
+fun Sequence<String>.average(): Double?
+    = map { it.toDoubleOrNull() ?: return null }.average()
+```
+The function we give to `map` performs a non-local return from our implementation if a non-numeric string is encountered.
+This generally would be unsafe if the mapped sequence were to escape from our implementation.
+However, the new type system is able to verify that no such escape occurs, and so this non-local return can be allowed.
+
+### Non-Local `suspend`
+
+Kotlin already has a special [exception](https://kotlinlang.org/spec/asynchronous-programming-with-coroutines.html) to function-coloring rules for inline lambda parameters: when a higher-order function that invokes an inline lambda is called from a suspending function, this lambda is allowed to also have suspension points and call other suspending functions.
+Just as with non-local returns, we can now extend this support to anything with a local lifetime.
+This enables interesting "effect-polymorphic" programs, which can be used to address even problems such as cross-platform support across synchronous and asynchronous environments.
+
+For example, suppose we had an interface `IOEnvironment` that provides all the basic functionality for performing synchronous I/O.
+Any function that takes a `local IOEnvironment` parameter can be called with either a standard synchronous implementation *or* with an asynchronous `suspend`ing implementation provided it is called within a `suspend`ing function.
+In the latter case, the new type system will be able to determine that all the `suspend`s in the implementation of the asynchronous `IOEnvironment` necessarily occur within the containing `suspend`ing function, making them safe.
+In fact, support for and integration of coroutines can be broadly improved using local lifetimes, as discussed in more depth in the design notes for [stacks](https://github.com/Kotlin/KEEP/blob/main/notes/0008-stacks.md).
+
+### Stack Allocation
+
+On certain platforms, local lifetimes enable significantly more opportunities for allocating objects on the stack rather than the heap.
+In particular, any statically-sized object that can be given a local lifetime, i.e. a lifetime within the lifetime of the current function call, can be allocated directly in the current call frame rather than on the heap.
+Notably, this applies to `local vararg` parameters, enabling the array of arguments to be allocated within the stack rather than heap, making use of varargs much more efficient.
+In general, many common patterns can now be implemented efficiently without inlining or the resulting code bloat.
 
 # Disclaimer
 
@@ -59,25 +189,7 @@ We are sharing it early because we want to collect feedback (hopes, concerns, su
 
 # Design
 
-This design first and foremost contributes the `local` keyword as a means for restricting functions to use a parameter in only a "local" manner so that callers can be guaranteed their corresponding arguments do not "escape" the call, thereby both providing useful software-engineering compositionality guarantees and safely enabling arguments to have more advanced functionality.
-
-This design is a follow-up to the existing `callsInPlace` experimental feature.
-Whereas `callsInPlace` is a CFG analysis, local lifetimes are directly incorporated into the type system, which makes it more robust.
-For example, the following program is accepted using local lifetimes but rejected using CFG analyses:
-```
-fun <T> Sequence<T>.sum(local convert: (T) -> Int): Int
-    = map(convert).sum()
-```
-One issue is that CFG analyses are intraprocedural (except for `inline` functions), and so have to treat `map` as a black box that could potentially leak `convert`.
-Another issue is that—even if we were to inline `map`—`map` returns a sequence that *lazily* generates its values, and that *object* repeatedly calls `convert`, which looks to the `callsInPlace` analysis like the function is being leaked onto the heap.
-By integrating locality into the type system, we can restrict the lifetime of that object, and then later confirm that it is only used within its restricted lifetime.
-
-Note that there is a KEEP in development for adding syntax for directly integrating `callsInPlace` via `local` parameters.
-That KEEP still uses a CFG analysis, but its syntax is designed to be forwards compatible with this proposal.
-
-## Overview
-
-The following is an example of a function using this feature and conforming to its restrictions:
+The following is an example of a function using local lifetimes and conforming to its restrictions:
 ```
 fun <E, R> local Iterator<E>.fold(init: R, local folder: (R, E) -> R): R {
     var result = init
@@ -118,16 +230,16 @@ This means that the lifetimes of `local` parameters effectively become tracked b
 
 This lifetime perspective/guarantee enables us to use things like `return` inside functions to `local` parameters.
 `return` effectively captures a reference to the continuation of the current call.
-Unlike instances of Kotlin's `Continuation` from the `kotlin.coroutine` libraries, the continuation of the current call has a limited lifetime (which is critical to using a stack of call frames).
+Unlike instances of Kotlin's `Continuation` from the `kotlin.coroutine` library, the continuation of the current call has a limited lifetime (which is critical to using a stack of call frames).
 This means that `return` must have a limited lifetime, and consequently the lambda using it must as well.
-But the use of `local` ensures the callee respects this limited lifetime.
+Thankfully the use of `local` ensures the callee respects this limited lifetime.
 
 We can also use this lifetime perspective/guarantee to expand upon the functionality of this feature.
 For example, supporting the following function might be useful:
 ```
 fun <A, B> local Iterator<A>.map(
     local transform: (A) -> B
-): Iterator<B>_{this&transform} = object : Iterator {
+): Iterator<B>^this^transform = object : Iterator {
     override fun hasNext() = this@map.hasNext()
     override fun next() = transform(this@map.next())
     override fun remove() = this@map.remove()
@@ -135,8 +247,8 @@ fun <A, B> local Iterator<A>.map(
 ```
 This extension method returns an `Iterator` whose method implementations capture the `this` and `transform` parameters.
 As such, the methods of this `Iterator` are only safe to invoke within the lifetimes of those parameters.
-The type modifier `_{this&transform}` indicates that, rather than having the default global lifetime, the returned `Iterator`'s lifetime is restricted by that of `this` and `transform`.
-(For functions with restricted lifetimes, we use the specialized syntax `(Input, ...) ->_{lifetime} Output`.)
+The type modifier `^this^transform` indicates that, rather than having the default global lifetime, the returned `Iterator`'s lifetime is restricted by that of `this` and `transform`.
+(For functions with restricted lifetimes, we use the specialized syntax `(Input, ...) ->^lifetime Output`.)
 
 So `local` is, more precisely, an indicator that a lifetime should be tracked instead of assumed to be global.
 Because the default lifetime is global, that will prevent such parameters from flowing arbitrarily out of the function.
@@ -149,27 +261,27 @@ Above we defined an extension method for `Iterator`, so now consider the followi
 ```
 fun <A,B> local Iterable<A>.map(
     local transform: (A) -> B
-): Iterable<B>_{this&transform} = object : Iterable {
+): Iterable<B>^this^transform = object : Iterable {
     override fun iterator() = this@map.iterator().map(transform)
 }
 ```
-At first, this seems perfectly safe, but realize that `Iterable.iterator()` expects to return an `Iterator` with a `global` lifetime, whereas the `Iterator` constructed here must have its lifetime restricted to within the lifetimes of `this` and `transform`.
+At first, this seems perfectly safe, but realize that `Iterable.iterator()` expects to return an `Iterator` with a `global` lifetime, whereas the `Iterator` constructed by this `iterator()` implementation must have its lifetime restricted to within the lifetimes of `this` and `transform`.
 For methods like `toString`, it makes sense for the returned object to have a global lifetime.
 But for methods like `Iterable.iterator`, the expectation is that the returned object is a view of the `Iterable` object and as such should only be valid while that object is valid.
 
 We can reflect this by localizing the signature of `Iterable` to propagate lifetime constraints:
 ```
 interface Iterable<E> {
-    fun iterator(): Iterator<E>_{this}
+    fun iterator(): Iterator<E>^this
 }
 ```
 Here we have restricted the lifetime of the `Iterator` returned by `iterator` to within that of the receiver.
 This modification in turn makes our extension method above valid.
 
 As a technical note, the `this` lifetime must only be used contravariantly in an interface's signature.
-The `_{-}` operator is itself contravariant, so this restriction means that `_{this}` can only be applied to types at covariant positions in the signature.
+The `^` operator is itself contravariant, so this variance restriction means that `^this` can only be applied to types at covariant positions in the signature.
 A major advantage of this restriction is that all existing classes and interfaces implementing/extending an interface will continue to be valid implementations/extensions even after localizing the interface!
-That is, localizing interfaces enables more implementations rather than rejects implementations.
+That is, localizing interfaces enables more implementations rather than rejecting existing implementations.
 
 ## Localizing Classes
 
@@ -178,19 +290,19 @@ Localizing a class enables instances of that class to use local values.
 
 When a constructor specifies a parameter is `local`, that means the parameter is not allowed to escape the lifetime of the call to the *constructor*.
 This is perfect for the builder pattern, since the building function is never used after the construction of the object is completed.
-However, it does not work for mapping iterators and iterables because the mapping function is used after construction; in particular, it is used by the object returned by the construction.
+However, it does not work for mapping iterators and iterables because the mapping function can be used by the object returned by the constructor *after* the call to the constructor has finished.
 Thus, the lifetime of the returned object needs to be restricted to that of the parameter.
 
 As a first step, we allow one to declare a class to be local.
 Whereas objects of current classes all have global lifetimes, each object of a `local class` can have its own lifetime.
-That is, a `local class` is implicitly parameterized by a `this` lifetime, representing the lifetime of the object, *and* the lifetime of its `this` reference is restricted to the `this` lifetime.
+That is, a `local class` is implicitly parameterized by a `this` lifetime, representing the lifetime of the object; furthermore, the lifetime of its `this` reference is restricted to the `this` lifetime.
 This makes it possible for each object of a `local class` to safely access resources with limited lifetimes *provided* those resources have at least the lifetime of the object.
 
 The following illustrates how we can apply this to mapping iterators/iterables:
 ```
 local class MappingIterator<A, out B>(
-    private val iterator: Iterator<A>_{this},
-    private val transform: (A) ->_{this} B
+    private val iterator: Iterator<A>^this,
+    private val transform: (A) ->^this B
 ) : Iterator<B> {
     override fun hasNext() = iterator.hasNext()
     override fun next() = transform(iterator.next())
@@ -198,17 +310,17 @@ local class MappingIterator<A, out B>(
 }
 
 local class MappingIterable<A, out B>(
-    private val iterable: Iterable<A>_{this},
-    private val transform: (A) ->_{this} B
+    private val iterable: Iterable<A>^this,
+    private val transform: (A) ->^this B
 ) : Iterable<B> {
     override fun iterator()
         = MappingIterator(iterable.iterator(), transform)
 }
 ```
-Notice that we have added `local` before `class` to indicate that the lifetime of their objects may vary.
+Notice that we have added `local` before each `class` to indicate that the lifetime of their objects may vary.
 This also means that the `this` lifetime of these objects is effectively a locality parameter to their construction.
-This locality parameter is implicit, so when we construct an object of these classes, the algorithm will automatically determine what lifetime the object should have for the constructors arguments to be valid.
-In this case, we've added `_{this}` to some parameters of the constructor to indicate that the lifetime of those parameters must exceed that of `this` object so that they can be safely accessed by its methods.
+This locality parameter is implicit, so when we construct an object of these classes, the algorithm will automatically determine what lifetime the object should have for the constructor's arguments to be valid.
+In this case, we've added `^this` to some parameters of the constructor to indicate that the lifetime of those parameters must exceed that of `this` object so that they can be safely accessed by its methods.
 This has the effect of restricting the object's lifetime to be within the lifetimes of the relevant parameters.
 
 ### Inheritance
@@ -258,28 +370,28 @@ For each `local` parameter, we associate a corresponding lifetime parameter.
 Note that when we call a function with a parameter that itself is a function with a `local` parameter, we will have to use a technique for supporting nested generic methods.
 We have already developed such a technique, so I won't repeat it here.
 
-We validate objects with limited lifetimes by using a type modifier `_{lifetime}`.
+We validate objects with limited lifetimes by using a type modifier `^lifetime`.
 This modifier is applied to the type of each `local` parameter (using its associated lifetime parameter).
 
 Subtyping judgements are modified to look like `type <: type' | lifetimes`, which means `type` is a subtype of `type'` assuming their values are used only within all of the lifetimes listed by `lifetimes`.
-A subtyping of the form `type <: type'_{lifetime} | lifetimes` holds if and only if `type <: type' | lifetimes, lifetime` holds.
-A subtyping of the form `type_{lifetime} <: Foo<types'> | lifetimes` holds if and only if `type <: Foo<types'> | lifetimes` *and* `lifetimes <: lifetime` hold, where the latter is a judgement about solely sub-lifetimes.
+A subtyping of the form `type <: type'^lifetime | lifetimes` holds if and only if `type <: type' | lifetimes, lifetime` holds.
+A subtyping of the form `type^lifetime <: Foo<types'> | lifetimes` holds if and only if `type <: Foo<types'> | lifetimes` *and* `lifetimes <: lifetime` hold, where the latter is a judgement about solely sub-lifetimes.
 
 Note that this judgement about sub-lifetimes allows multiple lifetimes on the left, and as such it is amenable to supporting lifetime parameters with multiple upper bounds (but only one lower bound).
 This is important because various points in a function body will have an associated abstract lifetime (representing how long things like accesses to local variables or uses of local control operations will be safe), and that abstract lifetime needs to be upper-bounded by the lifetime parameter of each `local` parameter and by the abstract lifetime of any outer points that the current point is nested within.
 
 Fortunately it seems that, at least algorithmically speaking, this feature is a relatively straightforward extension of the existing techniques we have for outference.
-That said, the technique for supporting for nested generic methods was originally for hypothetical extensions, so its pragmatics have not been discussed or explored much.
+That said, the technique for supporting nested generic methods was originally for hypothetical extensions, so its pragmatics have not been discussed or explored much.
 
 ## Run-Time Implementation
 
 This feature enables new forms of control.
 For example, a `local` parameter can `break` out of the loop of some calling function, or can `suspend` some containing coroutine.
-The former is a lexical abort (rather than a dynamic abort, like throwing an exception), and the latter is a lexical suspend.
+The former is a lexically-scoped abort (rather than a dynamically-scoped abort, like throwing an exception), and the latter is a lexically-scoped suspend.
 
-### Lexical Aborts
+### Lexically-Scoped Aborts
 
-There are two key ways we can implement lexical aborts, though some backends will only be amenable to one of these.
+There are two key ways we can implement lexically-scoped aborts, though some backends will only be amenable to one of these.
 One important consideration is the interaction with `finally`.
 That is, if the abort happens from somewhere "inside" a `try` and redirects control to somewhere "outside" that `try`, then we should execute the corresponding `finally` block in the interim.
 
@@ -287,38 +399,37 @@ The easiest way to do this is to piggyback on dynamic aborts.
 That is, one throws a special exception that's ignored by (user-level) `catch` but still executes `finally` blocks as the stack is unwound.
 The special exception is created with some identifier of the relevant call frame, and it bubbles up until it reaches that frame, at which point control jumps to the relevant point in the calling function.
 
-Another way is to track where the most recent `finally` block is on the stack and jump straight to it, handing it the lexical abort to continue performing afterwards.
+Another way is to track where the most recent `finally` block is on the stack and jump straight to it, handing it the lexically-scoped abort to continue performing afterwards.
 
 Each technique has its own performance and interoperability tradeoffs, and both have circumstances where they are much better suited than the other.
 
-### Lexical Suspends
+### Lexically-Scoped Suspends
 
-There are two key ways we can implement lexical suspends, though some backends will only be amenable to one of these.
-The key issue is that we can no longer always implement `suspend` using conversion to automata.
+There are two key ways we can implement lexically-scoped suspends, though some backends will only be amenable to one of these.
+(Note that we cannot always implement `suspend` using conversion to automata.)
 
 One way is to adopt first-class stacks (a.k.a. lightweight threads or green threads).
 Every (non-automata-convertible) coroutine would have its own call stack, and would keep track of whom to transer control to when `suspend`ed.
 
-Another way is to make functions that can potentially suspend (do to being given a `suspend` or `local` parameter) instead return something like a promise.
-That is, the function returns either a value of the expected type or something that a (unique) callback can be registered on to be called with the value when the suspended computation is resumed.
-The caller then checks which case occurred and either continues with the value immediately or registers the callback for doing so later.
+Another way is to compile functions that can potentially suspend (due to being given a `suspend` or `local` parameter) so that they copy their stack frame onto the heap if a suspension occurs.
 (Alternatively, one could commit to always use continuation-passing style rather than try to optimize for the case where no suspension happens.)
 
 Each technique has its own performance and interoperability tradeoffs, and both have circumstances where they are much better suited than the other.
+Most importantly, unlike now where `suspend` functions have a different compiled signature than normal functions (because they take an additional parameter), we need potentially-suspending functions to have the same compiled signature as normal functions.
 
 ## Advanced Locality Polymorphism
 
-As mentioned, `local` parameters are type-checked by encoding them as locality polymorphism.
+As mentioned, `local` parameters are type-checked by encoding them using locality polymorphism.
 In rare advanced cases (possibly only within the standard library), it is useful to write locality-polymorphic signatures directly.
 In fact, the only cases I know of arise only when we add support for stacks; nonetheless, it seems make more sense to speak about the feature here rather than when introducing stacks.
 
 Just as generic classes/interfaces/methods/functions can have type parameters, so can they have locality parameters.
-Such parameters can be specified using `local x` (rather than just `X` for a type parameter).
+Such parameters can be specified using `local x` (rather than just `X` for a type parameter), where these names live in a distinct namespace and so can overlap with local variables.
 So, for example, we could make the signature for `Iterable.map` slightly more expressive:
 ```
-fun <A, B, local this, local transform> Iterator<A>_{this}.map(
-    transform_{transform}: (A) -> B
-): Iterator<B>_{this&transform} = object : Iterator {
+fun <A, B, local this, local transform> Iterator<A>^this.map(
+    transform: (A) ->^transform B
+): Iterator<B>^this^transform = object : Iterator {
     override fun hasNext() = this@map.hasNext()
     override fun next() = transform(this@map.next())
     override fun remove() = this@map.remove()
@@ -328,8 +439,8 @@ fun <A, B, local this, local transform> Iterator<A>_{this}.map(
 How is this more expressive than before?
 Well, unlike the previous localized signature, neither the `iterator` nor the `transform` lifetime need to be accessible *during* the call to `map`.
 That is, explicitly declared locality parameters have *no* upper or lower bound (by default).
-One can optionally impose such bounds by changing the declaration to be `local_{lower}^{upper} x`; one can also specify only a lower bound or only an upper bound, though if both are specified than the lower bound needs to be a sub-lifetime of the upper bound.
-(The type syntax `Foo_{lifetime}` is related because it means the lifetime of the object is lower-bounded by `lifetime`.)
+One can optionally impose such bounds by changing the declaration to be `local^lower x`; one can also use `where x : upper` to specify an upper bound (which must be a superlifetime of `x`'s lower bound if it has one).
+(The type syntax `Foo^lifetime` is related because it means the lifetime of the object is lower-bounded by `lifetime`.)
 
 Also, on occasion it can be useful for a function/method to refer to the lifetime of the current call.
 For this, we can reuse the keyword `local` itself as a lifetime.
@@ -344,44 +455,45 @@ fun <E, R> local Iterator<E>.fold(
 ```
 is shorthand for
 ```
-fun <E, R, local_{local} this, local_{local} folder> Iterator<E>_{this}.fold(
+fun <E, R, local^local this, local^local folder> Iterator<E>^this.fold(
     init: R,
-    folder: (R, E) ->_{folder} R
+    folder: (R, E) ->^folder R
 ): R
 ```
 This signature is itself equivalent to
 ```
-fun <E, R> Iterator<E>_{local}.fold(
+fun <E, R> Iterator<E>^local.fold(
     init: R,
-    folder: (R, E) ->_{local} R
+    folder: (R, E) ->^local R
 ): R
 ```
 The compiler can take advantage of such simplifying equivalences to speed up type-checking.
-Similarly, given this shorthand, it makes sense to allow `local^{upper}` when declaring a function parameter (provided `upper` is a super-lifetime of the implicitly lower-bounding `local` lifetime).
-It might also make sense to allow overriding the default lower bound, including allowing `_{}` to indicate there should be no lower bound.
+Similarly, given this shorthand, it makes sense to allow `local^lower` when declaring a function parameter in order to use `lower` as the lower bound rather than the default.
+Since it is a common pattern, it also makes sense to allow `local^ ` to drop the default lower bound entirely.
 This would allow one to express the more expressive signature for `map` without significantly changing it like we had to above:
 ```
-fun <A, B> local_{} Iterator<A>.map(
-    local_{} transform: (A) -> B
-): Iterator<B>_{this&transform} = object : Iterator {
+fun <A, B> local^ Iterator<A>.map(
+    local^ transform: (A) -> B
+): Iterator<B>^this^transform = object : Iterator {
     override fun hasNext() = this@map.hasNext()
     override fun next() = transform(this@map.next())
     override fun remove() = this@map.remove()
 }
 ```
 
-Finally, by default `fun` declarations create functions that either have the `global` lifetime (when they are declaraing top-level functions and extension methods or methods of non-`local` classes) or the `local` lifetime (when they are declaring methods of interfaces or `local` classes).
+Finally, by default `fun` declarations create functions that either have the `global` lifetime (when they are declaring top-level functions and extension methods or methods of non-`local` classes) or the `local` lifetime (when they are declaring methods of interfaces or `local` classes).
 The lifetime of a function is the upper bound of its `local` lifetime parameter.
 On rare occasion, it can be useful to override this default behavior.
-One does so by using the syntax `fun_{lifetime}`.
-For example, if an interface has a method for creating child objects, often that method could be declared `fun_{global}` because the allocation does not actually access the object; it just creates a new child object and hands it a reference to the parent object.
+One does so by using the syntax `fun^lifetime`.
+For example, if an interface has a method for creating child objects, often that method could be declared `fun^global` because the allocation does not actually access the object; it just creates a new child object and hands it a reference to the parent object.
+(The returned child object then must have its lifetime restricted to that of the parent object.)
 
 ## Advanced Reference Equality
 
 Performing reference equality needs access to the identifier/address of the objects being compared.
 By default, this is only accessible for an object when it is live, which is important for being able to stack allocate it.
 However, it can be useful for an object's identifier/address to be accessible even outside its lifetime.
-To permit this for objects of a particular class/interface, one can declare the class/interface using `class_{global}` or `interface_{global}` (even if the class is `local`).
+To permit this for objects of a particular class/interface, one can declare the class/interface using `class^global` or `interface^global` (even if the class is `local`).
 
 # Localizing the Standard Library
 
@@ -415,7 +527,7 @@ Similar changes were made to `MutableList` and `MutableMap` with similar reasoni
 We made the mutable parameter given to the action of builders `local`:
 ```
 public inline fun <K, V> buildMap(
-    once builderAction: local MutableMap<K, V>.() -> Unit
+    local once builderAction: local MutableMap<K, V>.() -> Unit
 ): Map<K, V>
 ```
 In theory, this could break existing builder actions.
@@ -438,7 +550,7 @@ Surprisingly, as of yet this change has not *yet* been needed to localize the st
 The following is a more-involved example of what the process for localizing a library looks like.
 We start the example with the relevant outward-facing function provided by the library.
 Note that this example uses the `Sequence<out T>` interface.
-Like `Iterable<out T>`, this interface is localized by making its `iterator()` method return an `Iterator<T>_{this}`, reflecting the fact that the iterator typically accesses the same local resources the sequence has access to.
+Like `Iterable<out T>`, this interface is localized by making its `iterator()` method return an `Iterator<T>^this`, reflecting the fact that the iterator typically accesses the same local resources the sequence has access to.
 
 In this example, the function we want to localize originally looks like the following:
 ```
@@ -450,7 +562,7 @@ We first want to localize it to allow the sequence being flattened to use local 
 That involves marking it as `local` *and* correspondingly restricting the lifetime of the returned sequence, since that sequence is lazily generated and so holds onto the input sequence:
 ```
 public fun <T> local Sequence<Sequence<T>>.flatten(
-): Sequence<T>_{this}
+): Sequence<T>^this
     = flatten { it.iterator() }
 ```
 But we can take this further.
@@ -460,15 +572,15 @@ Instead, we can make the signature polymorphic with respect to some non-global l
 We could do so by adding a new explicit locality parameter, or we can simply reusing the existing locality parameter `this` that we get by making the receiver a `local` parameter.
 In the latter case, the algorithm will automatically determine a suitable common lifetime of both the receiver sequence and the nested sequences:
 ```
-public fun <T> local Sequence<Sequence<T>_{this}>.flatten(
-): Sequence<T>_{this}
+public fun <T> local Sequence<Sequence<T>^this>.flatten(
+): Sequence<T>^this
     = flatten { it.iterator() }
 ```
 Lastly, we can make the signature slightly more general by observing that none of these sequences are actually accessed during the call to `flatten`.
-By default, all `local` parameters to a function must have a lifetime that is at least accessible during the function call, but we can drop that implicit lower bound by using `local_{}`:
+By default, all `local` parameters to a function must have a lifetime that is at least accessible during the function call, but we can drop that implicit lower bound by using `local^ `:
 ```
-public fun <T> local_{} Sequence<Sequence<T>_{this}>.flatten(
-): Sequence<T>_{this}
+public fun <T> local^ Sequence<Sequence<T>^this>.flatten(
+): Sequence<T>^this
     = flatten { it.iterator() }
 ```
 Now we have a very general localization of our original signature, one that is particularly advanced due to the original signature's use of nesting and the implementation's use of laziness.
@@ -476,9 +588,9 @@ Now we have a very general localization of our original signature, one that is p
 With that localized signature in hand, next let us see what it takes to show that the implementation satisfies this more restrictive signature.
 In particular, this implementation uses the following private extension method, which we can localize as follows:
 ```
-private fun <T, R> local_{} Sequence<T>.flatten(
-    iterator: (T) ->_{this} Iterator<R>_{this}
-): Sequence<R>_{this} {
+private fun <T, R> local^ Sequence<T>.flatten(
+    iterator: (T) ->^this Iterator<R>^this
+): Sequence<R>^this {
     if (this is TransformingSequence) {
         return flatten(iterator)
     }
@@ -498,10 +610,10 @@ This means we move from localizing extension methods to localizing classes.
 The localized `TransformingSequence` class looks like the following:
 ```
 internal local class TransformingSequence<T, out R> constructor(
-    private val sequence: Sequence<T>_{this},
-    private val transformer: (T) ->_{this} R
+    private val sequence: Sequence<T>^this,
+    private val transformer: (T) ->^this R
 ) : Sequence<R> {
-    override fun iterator(): Iterator<R>_{this} = object : Iterator<R> {
+    override fun iterator(): Iterator<R>^this = object : Iterator<R> {
         val iterator = sequence.iterator()
         override fun next(): R {
             return transformer(iterator.next())
@@ -512,8 +624,8 @@ internal local class TransformingSequence<T, out R> constructor(
     }
 
     internal fun <E> flatten(
-        local_{} iterator: (R) -> Iterator<E>_{iterator}
-    ): Sequence<E>_{this&iterator} {
+        local^ iterator: (R) -> Iterator<E>^iterator
+    ): Sequence<E>^this^iterator {
         return FlatteningSequence<T, R, E>(sequence, transformer, iterator)
     }
 }
@@ -528,13 +640,13 @@ Lastly, both the implementation of `Sequence.flatten` and the implementation of 
 ```
 internal local class FlatteningSequence<T, R, E>
 constructor(
-    private val sequence: Sequence<T>_{this},
-    private val transformer: (T) ->_{this} R,
-    private val iterator: (R) ->_{this} Iterator<E>_{this}
+    private val sequence: Sequence<T>^this,
+    private val transformer: (T) ->^this R,
+    private val iterator: (R) ->^this Iterator<E>^this
 ) : Sequence<E> {
-    override fun iterator(): Iterator<E>_{this} = object : AbstractIterator<E> {
+    override fun iterator(): Iterator<E>^this = object : AbstractIterator<E> {
         val iterator = sequence.iterator()
-        var itemIterator: Iterator<E>_{this}? = null
+        var itemIterator: Iterator<E>^this? = null
         
         override fun computeNext() {
             itemIterator?.let {
@@ -591,8 +703,8 @@ public inline fun <T, R : Comparable<R>> local MutableList<T>.sortBy(
 This change built on top of two other (standard-looking) localizations we were able to make:
 ```
 public inline fun <T> compareBy(
-    local selector: (T) -> Comparable<*>?
-): Comparator<T>_{selector} =
+    local^ selector: (T) -> Comparable<*>?
+): Comparator<T>^selector =
     Comparator { a, b -> compareValuesBy(a, b, selector) }
     
 public expect fun <T> local MutableList<T>.sortWith(
@@ -608,7 +720,7 @@ Thus, since `sortBy` only hands that returned object to a function that only use
 Often constructor parameters end up being stored inside the object.
 We considered declaring such parameters as `local`, but this caused two problems.
 One problem was that often these parameters are also fields (i.e. `val parameter: Type`), so what is the type of such a field given that `local` is not a type modifier?
-By using `val parameter: Type_{this}`, it's clear what that type is.
+By using `val parameter: Type^this`, it's clear what that type is.
 But another problem is that sometimes the parameter *is* only used during the constructor and, as such, has no effect on the lifetime of the object.
 If `local` constructor parameters were used for "capturing" parameters, then what syntax would we use for the non-capturing-but-local-to-the-constructor parameters?
 These considerations are how we landed on our design for capturing parameters, and the following are a few examples of important constructors with non-capturing local parameters.
@@ -629,7 +741,7 @@ Kotlin supports delegated properties, where a field is accessed and/or mutated t
 Interestingly, because the delegated properties of an object are (by default) only accessible within that object's lifetime, it is safe for the delegate object to be restricted to have only that lifetime.
 As such, because we can update the signature of `lazy` as follows, a `local` class can use `val foo: Foo by lazy {...}` where `...` executes within the `this` lifetime.
 ```
-public expect fun <T> lazy(local_{} initializer: () -> T): Lazy<T>_{initializer}
+public expect fun <T> lazy(local^ initializer: () -> T): Lazy<T>^initializer
 ```
 Similarly, local delegated properties in functions can use delegate objects with just the `local` lifetime, so the `...` in `val x: Int = lazy {...}` is free to access all `local` parameters and even do things like `return` from the function.
 
@@ -646,7 +758,7 @@ AutoCloseable {
 
 We are able to localize the signature for `AutoCloseable` as follows:
 ```
-public expect inline fun AutoCloseable(local_{} closeAction: () -> Unit): AutoCloseable_{closeAction}
+public expect inline fun AutoCloseable(local^ closeAction: () -> Unit): AutoCloseable^closeAction
 ```
 
 As such, the code in `AutoCloseable {...}` is allowed to access `local` parameters and perform local control.
@@ -679,14 +791,14 @@ It does, however, highlight that it is critical that methods of non-local classe
 
 ### Restricting Type Parameters
 
-Lifetime restrictions `_{...}` can be imposed on any type.
+Lifetime restrictions `^` can be imposed on any type.
 This includes type parameters.
 (The theory for supporting this is achieved by modeling Kotlin-level types as higher-kinded low-level types with a contravariant locality parameter!)
 The most common way this functionality is used by the standard library is by functions for performing an operation into a destination that is then returned, such as the following:
 ```
 public fun <K, V, M : MutableMap<in K, in V>> local Array<out Pair<K, V>>.toMap(
     local destination: M
-): M_{destination} =
+): M^destination =
     destination.apply { putAll(this@toMap) }
 ```
 Here we want the return type to be the same as the (precise) type of the `destination` argument.
@@ -729,7 +841,7 @@ def function[I,O](f: (I) => O): Function[I,O] = Function(f)
 ## Pseudotypes
 
 Another difference is pseudotypes.
-The design for local lifetimes emphasize that `local` modifies *function parameters* whereas `_{...}` modifies *types*.
+The design for local lifetimes emphasize that `local` modifies *function parameters* whereas `^` modifies *types*.
 As an example, the `local` keyword is placed before the function-parameter name rather than after so that it does not look like it is part of the parameter's type.
 Scala, on the other hand, makes heavy use of pseudotypes, meaning notations that look like types but are not actually types.
 One example is the `=>` notation.
